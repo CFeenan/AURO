@@ -75,6 +75,7 @@ class RobotController(Node):
         self.look_count = 0
         self.front_left_ranges = []
         self.front_right_ranges = []
+        self.carrying_item = False
 
         
         self.declare_parameter('robot_id', 'robot1')
@@ -83,8 +84,8 @@ class RobotController(Node):
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
         
-        self.pick_up_service = self.create_client(ItemRequest, '/robot1/pick_up_item', callback_group=client_callback_group)
-        self.offload_service = self.create_client(ItemRequest, '/robot1/offload_item', callback_group=client_callback_group)
+        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
+        self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
         
         self.zone_subscriber = self.create_subscription(
             ZoneList,
@@ -182,49 +183,57 @@ class RobotController(Node):
         self.marker_publisher.publish(marker_input)
 
         self.get_logger().info(f"{self.state}")
-        
-        if len(self.items.data) >= 1:
-            self.get_logger().info(f"I SEE BALLS")
+
         
         match self.state:
             
             case State.FORWARD:
-                
-                if len(self.items.data) > 0:
-                    self.state = State.COLLECTING
-                    return
-                
+              
                 if self.look_count >= 4: 
                     self.state = State.LOOKING
                     print("now looking!")
                     return
                 
+                if len(self.zones.data) > 0 and self.carrying_item == True:
+                    self.state = State.RETRIEVING
+                    return
+
+                
+                # if self.scan_triggered[SCAN_FRONT]:
+                #     # Check specific segments within SCAN_FRONT
+                #     obstacle_front_left = any(
+                #         r < SCAN_THRESHOLD for r in self.front_left_ranges if r < float('inf') and not math.isnan(r)
+                #     )
+                #     obstacle_front_right = any(
+                #         r < SCAN_THRESHOLD for r in self.front_right_ranges if r < float('inf') and not math.isnan(r)
+                #     )
+
+                #     if obstacle_front_left and obstacle_front_right:
+                #         self.turn_direction = TURN_RIGHT
+                #         self.get_logger().info("Obstacles detected in both front-left and front-right sectors, turning right.")
+                #     elif obstacle_front_left:
+                #         self.turn_direction = TURN_RIGHT
+                #         self.get_logger().info("Obstacle detected in front-left sector, turning right.")
+                #     elif obstacle_front_right:
+                #         self.turn_direction = TURN_LEFT
+                #         self.get_logger().info("Obstacle detected in front-right sector, turning left.")
+                #     else:
+                #         self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                #         self.get_logger().info("General obstacle detected in front sector, randomly choosing turn direction.")
+
+                #     self.previous_yaw = self.yaw
+                #     self.state = State.TURNING
+                #     self.turn_angle = random.uniform(50, 80)
+                #     self.get_logger().info(f"Turning {('left' if self.turn_direction == TURN_LEFT else 'right')} by {self.turn_angle:.2f} degrees")
+                #     return
+                
                 if self.scan_triggered[SCAN_FRONT]:
-                    # Check specific segments within SCAN_FRONT
-                    obstacle_front_left = any(
-                        r < SCAN_THRESHOLD for r in self.front_left_ranges if r < float('inf') and not math.isnan(r)
-                    )
-                    obstacle_front_right = any(
-                        r < SCAN_THRESHOLD for r in self.front_right_ranges if r < float('inf') and not math.isnan(r)
-                    )
-
-                    if obstacle_front_left and obstacle_front_right:
-                        self.turn_direction = TURN_RIGHT
-                        self.get_logger().info("Obstacles detected in both front-left and front-right sectors, turning right.")
-                    elif obstacle_front_left:
-                        self.turn_direction = TURN_RIGHT
-                        self.get_logger().info("Obstacle detected in front-left sector, turning right.")
-                    elif obstacle_front_right:
-                        self.turn_direction = TURN_LEFT
-                        self.get_logger().info("Obstacle detected in front-right sector, turning left.")
-                    else:
-                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        self.get_logger().info("General obstacle detected in front sector, randomly choosing turn direction.")
-
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
-                    self.turn_angle = random.uniform(50, 80)
-                    self.get_logger().info(f"Turning {('left' if self.turn_direction == TURN_LEFT else 'right')} by {self.turn_angle:.2f} degrees")
+                    self.turn_angle = random.uniform(150, 170)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    self.get_logger().info("Detected obstacle in front, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
+                    self.look_count += 1
                     return
                 
         
@@ -244,10 +253,11 @@ class RobotController(Node):
                         self.get_logger().info(f"Detected obstacle to the right, turning left by {self.turn_angle} degrees")
                     return
                 
-                if len(self.items.data) > 0:
+                if len(self.items.data) > 0 and self.carrying_item == False:
                     self.state = State.COLLECTING
                     return
-
+                
+               
                 msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
                 self.get_logger().info(f"Publishing cmd_vel: linear.x={msg.linear.x}, angular.z={msg.angular.z}")
@@ -289,10 +299,16 @@ class RobotController(Node):
 
             case State.LOOKING:
 
-                if len(self.items.data) > 0:
+                if len(self.items.data) > 0 and self.carrying_item == False:
                     self.state = State.COLLECTING
                     self.get_logger().info("Item found during LOOKING, switching to COLLECTING state.")
                     return
+                
+                if len(self.zones.data) > 0:
+                    self.state = State.RETRIEVING
+                    self.get_logger().info("Zone found during LOOKING, switching to RETRIEVING state.")
+                    return
+                    
 
                 # Initialize LOOKING state parameters
                 if self.cumulative_turn == 0.0:
@@ -336,9 +352,17 @@ class RobotController(Node):
                     self.state = State.FORWARD
                     return
                 
-                item = self.items.data[0]
+                closestItem = 0
                 
-                estimated_distance = 32.4 * float(item.diameter) ** -0.75
+                for index, itemData in enumerate(self.items.data):
+                    if itemData.diameter >= self.items.data[closestItem].diameter:
+                        closestItem = index
+                         
+                item = self.items.data[closestItem] 
+                
+                estimated_distance = 69.0 * float(item.diameter) ** -0.89
+                
+                self.get_logger().info(f'Estimated distance {estimated_distance}')
                                 
                 if estimated_distance <= 0.35:
                     rqt = ItemRequest.Request()
@@ -361,18 +385,19 @@ class RobotController(Node):
                 msg = Twist()
                 msg.linear.x = 0.25 * estimated_distance
                 msg.angular.z = item.x / 320.0
-
                 self.cmd_vel_publisher.publish(msg)
                 
             case State.RETRIEVING:
                 if len(self.zones.data) == 0:
                     self.previous_pose = self.pose
-                    self.state = State.FORWARD
+                    self.state = State.LOOKING
                     return
                 
-                estimated_distance = 69.0 * float(item.diameter) ** -0.89
+                zone = self.zones.data[0] 
                 
-                if estimated_distance <= 0.2:
+                estimated_distance = 69.0 * float(zone.size) ** -0.89
+                
+                if estimated_distance <= 0.3:
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
                     
