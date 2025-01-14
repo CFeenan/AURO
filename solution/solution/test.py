@@ -11,8 +11,8 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from auro_interfaces.msg import StringWithPose
-from assessment_interfaces.msg import  Zone, ZoneList, Item, ItemList
+from auro_interfaces.msg import StringWithPose, Item, ItemList
+from assessment_interfaces.msg import  Zone, ZoneList
 from auro_interfaces.srv import ItemRequest
 
 from tf_transformations import euler_from_quaternion
@@ -35,7 +35,6 @@ SCAN_LEFT = 1
 SCAN_BACK = 2
 SCAN_RIGHT = 3
 
-
 # Finite state machine (FSM) states
 class State(Enum):
     FORWARD = 0
@@ -54,7 +53,7 @@ class RobotController(Node):
         #self.declare_parameter('y', 0.0)
         #self.declare_parameter('yaw', 0.0)
         
-        # zoneDict = {}
+        zoneDict = {}
 
         #self.initial_x = self.get_parameter('x').get_parameter_value().double_value
         #self.initial_y = self.get_parameter('y').get_parameter_value().double_value
@@ -71,11 +70,8 @@ class RobotController(Node):
         self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
         self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
-        self.zones = ZoneList()
+        # self.zones = ZoneList()
         self.look_count = 0
-        self.front_left_ranges = []
-        self.front_right_ranges = []
-
         
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
@@ -83,42 +79,39 @@ class RobotController(Node):
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
         
-        self.pick_up_service = self.create_client(ItemRequest, '/robot1/pick_up_item', callback_group=client_callback_group)
-        self.offload_service = self.create_client(ItemRequest, '/robot1/offload_item', callback_group=client_callback_group)
+        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
+        self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
         
         self.zone_subscriber = self.create_subscription(
             ZoneList,
-            '/robot1/zone',
+            '/zone',
             self.zone_callback,
             10
         )
     
         self.odom_subscriber = self.create_subscription(
             Odometry,
-            '/robot1/odom',
+            '/odom',
             self.odom_callback,
             10)
         
         self.item_subscriber = self.create_subscription(
             ItemList,
-            '/robot1/items',
+            '/items',
             self.item_callback,
-            10,  
-            callback_group=timer_callback_group
+            10
         )
         
         self.scan_subscriber = self.create_subscription(
             LaserScan,
-            '/robot1/scan',
+            '/scan',
             self.scan_callback,
-            QoSPresetProfiles.SENSOR_DATA.value,
-             callback_group=timer_callback_group
-        )
+            QoSPresetProfiles.SENSOR_DATA.value)
         
         
-        self.cmd_vel_publisher = self.create_publisher(Twist, '/robot1/cmd_vel', 10)
+        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
         
-        self.marker_publisher = self.create_publisher(StringWithPose, '/robot1/marker_input', 10)
+        self.marker_publisher = self.create_publisher(StringWithPose, '/marker_input', 10)
         
         # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
         self.timer_period = 0.1 # 100 milliseconds = 10 Hz
@@ -126,8 +119,6 @@ class RobotController(Node):
 
     def item_callback(self, msg):
         self.items = msg
-        self.get_logger().debug(f"Received items: {self.items.data}")
-
         
     def zone_callback(self, msg):
         self.zones = msg
@@ -155,8 +146,8 @@ class RobotController(Node):
     def scan_callback(self, msg):
         # Group scan ranges into 4 segments
         # Front, left, and right segments are each 60 degrees
-
-        front_ranges = msg.ranges[331:359] + msg.ranges[0:30]
+        # Back segment is 180 degrees
+        front_ranges = msg.ranges[331:359] + msg.ranges[0:30] # 30 to 331 degrees (30 to -30 degrees)
         left_ranges  = msg.ranges[31:90] # 31 to 90 degrees (31 to 90 degrees)
         back_ranges  = msg.ranges[91:270] # 91 to 270 degrees (91 to -90 degrees)
         right_ranges = msg.ranges[271:330] # 271 to 330 degrees (-30 to -91 degrees)
@@ -167,13 +158,10 @@ class RobotController(Node):
         self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
         
-          # Process ranges for specific segments
-        self.front_left_ranges = msg.ranges[345:360] + msg.ranges[0:15]  # Adjust for circular indexing
-        self.front_right_ranges = msg.ranges[15:30] + msg.ranges[330:345]
-        
     
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
+        pass
 
         # Send message to rviz_text_marker node
         marker_input = StringWithPose()
@@ -183,51 +171,23 @@ class RobotController(Node):
 
         self.get_logger().info(f"{self.state}")
         
-        if len(self.items.data) >= 1:
-            self.get_logger().info(f"I SEE BALLS")
-        
         match self.state:
             
             case State.FORWARD:
-                
-                if len(self.items.data) > 0:
-                    self.state = State.COLLECTING
-                    return
                 
                 if self.look_count >= 4: 
                     self.state = State.LOOKING
                     print("now looking!")
                     return
-                
+
                 if self.scan_triggered[SCAN_FRONT]:
-                    # Check specific segments within SCAN_FRONT
-                    obstacle_front_left = any(
-                        r < SCAN_THRESHOLD for r in self.front_left_ranges if r < float('inf') and not math.isnan(r)
-                    )
-                    obstacle_front_right = any(
-                        r < SCAN_THRESHOLD for r in self.front_right_ranges if r < float('inf') and not math.isnan(r)
-                    )
-
-                    if obstacle_front_left and obstacle_front_right:
-                        self.turn_direction = TURN_RIGHT
-                        self.get_logger().info("Obstacles detected in both front-left and front-right sectors, turning right.")
-                    elif obstacle_front_left:
-                        self.turn_direction = TURN_RIGHT
-                        self.get_logger().info("Obstacle detected in front-left sector, turning right.")
-                    elif obstacle_front_right:
-                        self.turn_direction = TURN_LEFT
-                        self.get_logger().info("Obstacle detected in front-right sector, turning left.")
-                    else:
-                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        self.get_logger().info("General obstacle detected in front sector, randomly choosing turn direction.")
-
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
-                    self.turn_angle = random.uniform(50, 80)
-                    self.get_logger().info(f"Turning {('left' if self.turn_direction == TURN_LEFT else 'right')} by {self.turn_angle:.2f} degrees")
+                    self.turn_angle = random.uniform(150, 170)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    self.get_logger().info("Detected obstacle in front, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
                     return
                 
-        
                 if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
@@ -250,9 +210,7 @@ class RobotController(Node):
 
                 msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
-                self.get_logger().info(f"Publishing cmd_vel: linear.x={msg.linear.x}, angular.z={msg.angular.z}")
                 self.cmd_vel_publisher.publish(msg)
-                
 
                 difference_x = self.pose.position.x - self.previous_pose.position.x
                 difference_y = self.pose.position.y - self.previous_pose.position.y
@@ -338,8 +296,8 @@ class RobotController(Node):
                 
                 item = self.items.data[0]
                 
-                estimated_distance = 32.4 * float(item.diameter) ** -0.75
-                                
+                estimated_distance = 69.0 * float(item.diameter) ** -0.89
+                
                 if estimated_distance <= 0.35:
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id

@@ -1,3 +1,17 @@
+#
+# Copyright (c) 2024 University of York and others
+#
+# This program and the accompanying materials are made available under the
+# terms of the Eclipse Public License 2.0 which is available at
+# http://www.eclipse.org/legal/epl-2.0.
+# 
+# SPDX-License-Identifier: EPL-2.0
+#
+# Contributors:
+#   * Alan Millard - initial contributor
+#   * Pedro Ribeiro - revised implementation
+#
+ 
 import sys
 
 import rclpy
@@ -5,15 +19,12 @@ from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.qos import QoSPresetProfiles
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
 from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from auro_interfaces.msg import StringWithPose
-from assessment_interfaces.msg import  Zone, ZoneList, Item, ItemList
-from auro_interfaces.srv import ItemRequest
+from auro_interfaces.msg import StringWithPose, Item, ItemList
 
 from tf_transformations import euler_from_quaternion
 import angles
@@ -35,31 +46,19 @@ SCAN_LEFT = 1
 SCAN_BACK = 2
 SCAN_RIGHT = 3
 
-
 # Finite state machine (FSM) states
 class State(Enum):
     FORWARD = 0
     TURNING = 1
     COLLECTING = 2
     LOOKING = 3
-    RETRIEVING = 4 
-    
-    
+
+
 class RobotController(Node):
 
     def __init__(self):
         super().__init__('robot_controller')
-
-        #self.declare_parameter('x', 0.0)
-        #self.declare_parameter('y', 0.0)
-        #self.declare_parameter('yaw', 0.0)
         
-        # zoneDict = {}
-
-        #self.initial_x = self.get_parameter('x').get_parameter_value().double_value
-        #self.initial_y = self.get_parameter('y').get_parameter_value().double_value
-        #self.initial_yaw = self.get_parameter('yaw').get_parameter_value().double_value
-
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
         self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
@@ -71,67 +70,77 @@ class RobotController(Node):
         self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
         self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
-        self.zones = ZoneList()
-        self.look_count = 0
-        self.front_left_ranges = []
-        self.front_right_ranges = []
 
-        
-        self.declare_parameter('robot_id', 'robot1')
-        self.robot_id = self.get_parameter('robot_id').value
-        
-        client_callback_group = MutuallyExclusiveCallbackGroup()
-        timer_callback_group = MutuallyExclusiveCallbackGroup()
-        
-        self.pick_up_service = self.create_client(ItemRequest, '/robot1/pick_up_item', callback_group=client_callback_group)
-        self.offload_service = self.create_client(ItemRequest, '/robot1/offload_item', callback_group=client_callback_group)
-        
-        self.zone_subscriber = self.create_subscription(
-            ZoneList,
-            '/robot1/zone',
-            self.zone_callback,
+        self.item_subscriber = self.create_subscription(
+            ItemList,
+            '/items',
+            self.item_callback,
             10
         )
-    
+
+        # Subscribes to Odometry messages published on /odom topic
+        # http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Odometry.html
+        #
+        # Final argument can either be an integer representing the history depth, or a Quality of Service (QoS) profile
+        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1335-L1338
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1187-L1196
+        #
+        # If you only specify a history depth, rclpy defaults to QoSHistoryPolicy.KEEP_LAST
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L80-L83
         self.odom_subscriber = self.create_subscription(
             Odometry,
-            '/robot1/odom',
+            '/odom',
             self.odom_callback,
             10)
         
-        self.item_subscriber = self.create_subscription(
-            ItemList,
-            '/robot1/items',
-            self.item_callback,
-            10,  
-            callback_group=timer_callback_group
-        )
-        
+        # Subscribes to LaserScan messages on the /scan topic
+        # http://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/LaserScan.html
+        #
+        # QoSPresetProfiles.SENSOR_DATA specifices "best effort" reliability and a small queue size
+        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L455
+        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L428-L431
         self.scan_subscriber = self.create_subscription(
             LaserScan,
-            '/robot1/scan',
+            '/scan',
             self.scan_callback,
-            QoSPresetProfiles.SENSOR_DATA.value,
-             callback_group=timer_callback_group
-        )
-        
-        
-        self.cmd_vel_publisher = self.create_publisher(Twist, '/robot1/cmd_vel', 10)
-        
-        self.marker_publisher = self.create_publisher(StringWithPose, '/robot1/marker_input', 10)
-        
+            QoSPresetProfiles.SENSOR_DATA.value)
+
+        # Publishes Twist messages (linear and angular velocities) on the /cmd_vel topic
+        # http://docs.ros.org/en/noetic/api/geometry_msgs/html/msg/Twist.html
+        # 
+        # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
+        # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
+        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
+
+        # Publishes custom StringWithPose (see auro_interfaces/msg/StringWithPose.msg) messages on the /marker_input topic
+        # The week3/rviz_text_marker node subscribes to these messages, and ouputs a Marker message on the /marker_output topic
+        # ros2 run week_3 rviz_text_marker
+        # This can be visualised in RViz: Add > By topic > /marker_output
+        #
+        # http://docs.ros.org/en/noetic/api/visualization_msgs/html/msg/Marker.html
+        # http://wiki.ros.org/rviz/DisplayTypes/Marker
+        self.marker_publisher = self.create_publisher(StringWithPose, '/marker_input', 10)
+
         # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
         self.timer_period = 0.1 # 100 milliseconds = 10 Hz
-        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
+        self.timer = self.create_timer(self.timer_period, self.control_loop)
 
     def item_callback(self, msg):
         self.items = msg
-        self.get_logger().debug(f"Received items: {self.items.data}")
 
-        
-    def zone_callback(self, msg):
-        self.zones = msg
-        
+    # Called every time odom_subscriber receives an Odometry message from the /odom topic
+    #
+    # The Gazebo ROS differential drive plugin generates these messages using kinematic equations, and publishes them
+    # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L434-L535
+    #
+    # This plugin is configured with physical measurements of the TurtleBot3 in the SDF file that defines the robot model
+    # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble-devel/turtlebot3_gazebo/models/turtlebot3_waffle_pi/model.sdf#L476-L507
+    #
+    # The pose estimates are expressed in a coordinate system relative to the starting pose of the robot
     def odom_callback(self, msg):
         self.pose = msg.pose.pose # Store the pose in a class variable
 
@@ -150,13 +159,23 @@ class RobotController(Node):
         normalised = angles.normalize_angle(yaw - self.yaw)
         self.get_logger().info(f"Publishing diff yaw normalised: {normalised:.3f}")
         self.yaw = yaw # Store the yaw in a class variable
-        #self.orientation_publisher.publish(orientation)
-        
+        self.orientation_publisher.publish(orientation)
+
+    # Called every time scan_subscriber recieves a LaserScan message from the /scan topic
+    #
+    # The Gazebo RaySensor calculates distance at which rays intersect with obstacles
+    # The data is published by the Gazebo ROS ray sensor plugin
+    # https://github.com/gazebosim/gazebo-classic/tree/gazebo11/gazebo/sensors
+    # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_ray_sensor.cpp#L178-L205
+    #
+    # This plugin is configured to match the LiDAR on the TurtleBot3 in the SDF file that defines the robot model
+    # http://wiki.ros.org/hls_lfcd_lds_driver
+    # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble-devel/turtlebot3_gazebo/models/turtlebot3_waffle_pi/model.sdf#L132-L165
     def scan_callback(self, msg):
         # Group scan ranges into 4 segments
         # Front, left, and right segments are each 60 degrees
-
-        front_ranges = msg.ranges[331:359] + msg.ranges[0:30]
+        # Back segment is 180 degrees
+        front_ranges = msg.ranges[331:359] + msg.ranges[0:30] # 30 to 331 degrees (30 to -30 degrees)
         left_ranges  = msg.ranges[31:90] # 31 to 90 degrees (31 to 90 degrees)
         back_ranges  = msg.ranges[91:270] # 91 to 270 degrees (91 to -90 degrees)
         right_ranges = msg.ranges[271:330] # 271 to 330 degrees (-30 to -91 degrees)
@@ -166,12 +185,8 @@ class RobotController(Node):
         self.scan_triggered[SCAN_LEFT]  = min(left_ranges)  < SCAN_THRESHOLD
         self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
-        
-          # Process ranges for specific segments
-        self.front_left_ranges = msg.ranges[345:360] + msg.ranges[0:15]  # Adjust for circular indexing
-        self.front_right_ranges = msg.ranges[15:30] + msg.ranges[330:345]
-        
-    
+
+
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
 
@@ -181,53 +196,20 @@ class RobotController(Node):
         marker_input.pose = self.pose # Set the pose of the RViz marker to track the robot's pose
         self.marker_publisher.publish(marker_input)
 
-        self.get_logger().info(f"{self.state}")
-        
-        if len(self.items.data) >= 1:
-            self.get_logger().info(f"I SEE BALLS")
+        # self.get_logger().info(f"{self.state}")
         
         match self.state:
-            
+
             case State.FORWARD:
-                
-                if len(self.items.data) > 0:
-                    self.state = State.COLLECTING
-                    return
-                
-                if self.look_count >= 4: 
-                    self.state = State.LOOKING
-                    print("now looking!")
-                    return
-                
+
                 if self.scan_triggered[SCAN_FRONT]:
-                    # Check specific segments within SCAN_FRONT
-                    obstacle_front_left = any(
-                        r < SCAN_THRESHOLD for r in self.front_left_ranges if r < float('inf') and not math.isnan(r)
-                    )
-                    obstacle_front_right = any(
-                        r < SCAN_THRESHOLD for r in self.front_right_ranges if r < float('inf') and not math.isnan(r)
-                    )
-
-                    if obstacle_front_left and obstacle_front_right:
-                        self.turn_direction = TURN_RIGHT
-                        self.get_logger().info("Obstacles detected in both front-left and front-right sectors, turning right.")
-                    elif obstacle_front_left:
-                        self.turn_direction = TURN_RIGHT
-                        self.get_logger().info("Obstacle detected in front-left sector, turning right.")
-                    elif obstacle_front_right:
-                        self.turn_direction = TURN_LEFT
-                        self.get_logger().info("Obstacle detected in front-right sector, turning left.")
-                    else:
-                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        self.get_logger().info("General obstacle detected in front sector, randomly choosing turn direction.")
-
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
-                    self.turn_angle = random.uniform(50, 80)
-                    self.get_logger().info(f"Turning {('left' if self.turn_direction == TURN_LEFT else 'right')} by {self.turn_angle:.2f} degrees")
+                    self.turn_angle = random.uniform(150, 170)
+                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+                    self.get_logger().info("Detected obstacle in front, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
                     return
                 
-        
                 if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
@@ -250,9 +232,7 @@ class RobotController(Node):
 
                 msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
-                self.get_logger().info(f"Publishing cmd_vel: linear.x={msg.linear.x}, angular.z={msg.angular.z}")
                 self.cmd_vel_publisher.publish(msg)
-                
 
                 difference_x = self.pose.position.x - self.previous_pose.position.x
                 difference_y = self.pose.position.y - self.previous_pose.position.y
@@ -337,76 +317,51 @@ class RobotController(Node):
                     return
                 
                 item = self.items.data[0]
+
+                rqt = ItemRequest.Request()
+                rqt.robot_id = robot_id
                 
-                estimated_distance = 32.4 * float(item.diameter) ** -0.75
-                                
-                if estimated_distance <= 0.35:
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    
-                    try:
-                        future = self.pick_up_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info('Item picked up.')
-                            self.state = State.RETRIEVING
-                            self.items.data = []
-                        else:
-                            self.get_logger().info('Unable to pick up item: ' + response.message)
-                    except Exception as e:
-                       self.get_logger().info('Exception' + e)
-                    
+                try:
+                    future = pick_up_service.call_async(rqt)
+                    rclpy.spin_until_future_complete(node, future)
+                    response = future.result()
+                    if response.success:
+                        print('Item picked up.')
+                    else:
+                        print('Unable to pick up item: ' + response.message)
+                except Exception as e:
+                    print(e)   
+
+                estimated_distance = 69.0 * float(item.diameter) ** -0.89
 
                 msg = Twist()
                 msg.linear.x = 0.25 * estimated_distance
                 msg.angular.z = item.x / 320.0
 
                 self.cmd_vel_publisher.publish(msg)
-                
-            case State.RETRIEVING:
-                if len(self.zones.data) == 0:
-                    self.previous_pose = self.pose
-                    self.state = State.FORWARD
-                    return
-                
-                estimated_distance = 69.0 * float(item.diameter) ** -0.89
-                
-                if estimated_distance <= 0.2:
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    
-                    try:
-                        future = self.offload_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info('Item dropped off.')
-                            self.state = State.LOOKING
-                            self.zones.data = []
-                        else:
-                            self.get_logger().info('Unable to drop off item: ' + response.message)
-                    except Exception as e:
-                       self.get_logger().info('Exception' + e)
 
             case _:
                 pass
-            
+        
 
     def destroy_node(self):
         msg = Twist()
         self.cmd_vel_publisher.publish(msg)
         self.get_logger().info(f"Stopping: {msg}")
         super().destroy_node()
-    
+
+
 def main(args=None):
 
     rclpy.init(args = args, signal_handler_options = SignalHandlerOptions.NO)
 
     node = RobotController()
-    
+
     executor = MultiThreadedExecutor()
     executor.add_node(node)
+    
+    pick_up_service = node.create_client(ItemRequest, '/pick_up_item')
+    offload_service = node.create_client(ItemRequest, '/offload_item')
 
     try:
         rclpy.spin(node)
