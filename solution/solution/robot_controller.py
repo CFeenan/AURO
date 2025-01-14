@@ -76,8 +76,8 @@ class RobotController(Node):
         self.front_left_ranges = []
         self.front_right_ranges = []
         self.carrying_item = False
+        self.looking_initialised = False
 
-        
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
         
@@ -116,7 +116,6 @@ class RobotController(Node):
              callback_group=timer_callback_group
         )
         
-        
         self.cmd_vel_publisher = self.create_publisher(Twist, '/robot1/cmd_vel', 10)
         
         self.marker_publisher = self.create_publisher(StringWithPose, '/robot1/marker_input', 10)
@@ -129,7 +128,6 @@ class RobotController(Node):
         self.items = msg
         self.get_logger().debug(f"Received items: {self.items.data}")
 
-        
     def zone_callback(self, msg):
         self.zones = msg
         
@@ -144,7 +142,6 @@ class RobotController(Node):
                                                     self.pose.orientation.y,
                                                     self.pose.orientation.z,
                                                     self.pose.orientation.w])
-        
         
         orientation = Float32()
         orientation.data = yaw
@@ -188,16 +185,15 @@ class RobotController(Node):
         match self.state:
             
             case State.FORWARD:
-              
+                
                 if self.look_count >= 4: 
                     self.state = State.LOOKING
                     print("now looking!")
                     return
                 
                 if len(self.zones.data) > 0 and self.carrying_item == True:
-                    self.state = State.RETRIEVING
+                    distance_check = any(float(zone.size) > 0.05 for zone in self.zones.data)
                     return
-
                 
                 # if self.scan_triggered[SCAN_FRONT]:
                 #     # Check specific segments within SCAN_FRONT
@@ -236,7 +232,6 @@ class RobotController(Node):
                     self.look_count += 1
                     return
                 
-        
                 if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
                     self.previous_yaw = self.yaw
                     self.state = State.TURNING
@@ -256,14 +251,12 @@ class RobotController(Node):
                 if len(self.items.data) > 0 and self.carrying_item == False:
                     self.state = State.COLLECTING
                     return
-                
                
                 msg = Twist()
                 msg.linear.x = LINEAR_VELOCITY
                 self.get_logger().info(f"Publishing cmd_vel: linear.x={msg.linear.x}, angular.z={msg.angular.z}")
                 self.cmd_vel_publisher.publish(msg)
                 
-
                 difference_x = self.pose.position.x - self.previous_pose.position.x
                 difference_y = self.pose.position.y - self.previous_pose.position.y
                 distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
@@ -279,9 +272,17 @@ class RobotController(Node):
 
             case State.TURNING:
 
-                if len(self.items.data) > 0:
+                if len(self.items.data) > 0 and self.carrying_item == False:
                     self.state = State.COLLECTING
                     return
+                
+                if len(self.zones.data) > 0 and self.carrying_item == True:
+                    
+                    distance_check = any(float(zone.size) > 0.04 for zone in self.zones.data)
+                    
+                    if distance_check == True:
+                        self.state = State.RETRIEVING
+                        return
 
                 msg = Twist()
                 msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
@@ -304,46 +305,43 @@ class RobotController(Node):
                     self.get_logger().info("Item found during LOOKING, switching to COLLECTING state.")
                     return
                 
-                if len(self.zones.data) > 0:
-                    self.state = State.RETRIEVING
-                    self.get_logger().info("Zone found during LOOKING, switching to RETRIEVING state.")
-                    return
+                if len(self.zones.data) > 0 and self.carrying_item == True:
+                    distance_check = any(float(zone.size) > 0.04 for zone in self.zones.data)
                     
+                    if distance_check == True:
+                        self.state = State.RETRIEVING
+                        self.get_logger().info("Zone found during LOOKING, switching to RETRIEVING state.")
+                        
+                        return
+                        
 
-                # Initialize LOOKING state parameters
-                if self.cumulative_turn == 0.0:
-                    self.initial_yaw = self.yaw
-                    self.cumulative_turn = 0.0
-                    self.turning_direction = TURN_LEFT  # You can randomize this if desired
+                if self.looking_initialised == False:
+                    # Send stop command
+                    stop_msg = Twist()
+                    stop_msg.linear.x = 0.0
+                    stop_msg.angular.z = 0.0
+                    self.cmd_vel_publisher.publish(stop_msg)
+                    self.get_logger().info("Stopping movement before rotation.")
+
+                    # Initialize rotation
+                    self.previous_yaw = self.yaw
+                    self.state = State.TURNING
+                    self.turn_angle = 360
+                    self.turn_direction = TURN_LEFT
                     self.get_logger().info("Entering LOOKING state, starting 360-degree rotation.")
+                    self.looking_initialised = True
 
-                # Command rotation
                 msg = Twist()
-                msg.angular.z = self.turning_direction * ANGULAR_VELOCITY
+                msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
                 self.cmd_vel_publisher.publish(msg)
 
-                # Calculate yaw difference
-                current_yaw = self.yaw
-                yaw_diff = angles.normalize_angle(current_yaw - self.initial_yaw)
-                yaw_diff_deg = math.degrees(yaw_diff)
+                yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)                
 
-                # Update cumulative_turn based on direction
-                if self.turning_direction == TURN_LEFT:
-                    self.cumulative_turn += math.degrees(yaw_diff)
-                else:
-                    self.cumulative_turn -= math.degrees(yaw_diff)
-
-                # Normalize cumulative_turn
-                self.cumulative_turn = angles.normalize_angle(math.radians(self.cumulative_turn))
-                self.cumulative_turn_deg = math.degrees(math.fabs(self.cumulative_turn))
-
-                self.get_logger().debug(f"LOOKING: Cumulative Turn = {self.cumulative_turn_deg:.2f} degrees")
-
-                if self.cumulative_turn_deg >= 360.0:
-                    # Completed full rotation without finding an item
-                    self.cumulative_turn = 0.0
+                if math.fabs(yaw_difference) >= math.radians(self.turn_angle):
                     self.state = State.FORWARD
-                    self.get_logger().info("Completed 360-degree rotation without finding items, switching to FORWARD state.")
+                    self.get_logger().info("Completed 360-degree rotation without finding zones, switching to FORWARD state.")
+                    self.looking_initialised = False
+
 
             case State.COLLECTING:
 
@@ -357,8 +355,10 @@ class RobotController(Node):
                 for index, itemData in enumerate(self.items.data):
                     if itemData.diameter >= self.items.data[closestItem].diameter:
                         closestItem = index
-                         
+                        
+
                 item = self.items.data[closestItem] 
+                self.get_logger().info('diameter' + str(item.diameter))
                 
                 estimated_distance = 69.0 * float(item.diameter) ** -0.89
                 
@@ -370,12 +370,14 @@ class RobotController(Node):
                     
                     try:
                         future = self.pick_up_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
+                        self.executor.spin_until_future_complete(future)
                         response = future.result()
                         if response.success:
                             self.get_logger().info('Item picked up.')
+                            self.carrying_item = True
                             self.state = State.RETRIEVING
                             self.items.data = []
+                            
                         else:
                             self.get_logger().info('Unable to pick up item: ' + response.message)
                     except Exception as e:
@@ -388,31 +390,72 @@ class RobotController(Node):
                 self.cmd_vel_publisher.publish(msg)
                 
             case State.RETRIEVING:
+                
                 if len(self.zones.data) == 0:
                     self.previous_pose = self.pose
                     self.state = State.LOOKING
                     return
                 
-                zone = self.zones.data[0] 
+                closestZone = 0 
                 
-                estimated_distance = 69.0 * float(zone.size) ** -0.89
+                for index, zoneData in enumerate(self.zones.data):
+                    if zoneData.size >= self.zones.data[closestZone].size:
+                        closestZone = index
                 
-                if estimated_distance <= 0.3:
+                zone = self.zones.data[closestZone]
+                self.get_logger().info('Zoneinfo' + str(zone))
+                        
+                if zone.size <= 0.04:
+                    self.state = State.LOOKING
+                    return
+                
+                    
+                
+                # Improved speed calculation
+                k = 0.015  # Scaling factor
+                max_speed = 0.7  # Maximum speed in m/s
+                min_speed = 0.2  # Minimum speed in m/s
+
+                try:
+                    zone_size = float(zone.size)
+                    if zone_size <= 0:
+                        zone_size = 0.05  # Prevent division by zero or negative sizes
+                    estimated_speed = k / zone_size
+                    estimated_speed = max(min_speed, min(estimated_speed, max_speed))
+                except Exception as e:
+                    self.get_logger().error(f"Error calculating speed: {e}")
+                    estimated_speed = min_speed
+                
+                if float(zone.size) >= 0.97:
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
                     
                     try:
                         future = self.offload_service.call_async(rqt)
-                        rclpy.spin_until_future_complete(self, future)
+                        self.executor.spin_until_future_complete(future)
                         response = future.result()
                         if response.success:
+                            
+                            msg = Twist()
+                            msg.linear.x = 0.0
+                            
+                            self.cmd_vel_publisher.publish(msg)
+                            
                             self.get_logger().info('Item dropped off.')
                             self.state = State.LOOKING
+                            self.carrying_item = False
                             self.zones.data = []
+                            
                         else:
                             self.get_logger().info('Unable to drop off item: ' + response.message)
                     except Exception as e:
                        self.get_logger().info('Exception' + e)
+                
+                msg = Twist()
+                msg.linear.x = estimated_speed
+                msg.angular.z = zone.x / 320.0
+                self.cmd_vel_publisher.publish(msg)
+                
 
             case _:
                 pass
@@ -434,7 +477,7 @@ def main(args=None):
     executor.add_node(node)
 
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     except ExternalShutdownException:
