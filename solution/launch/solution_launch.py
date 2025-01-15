@@ -68,7 +68,7 @@ def generate_launch_description():
 
     declare_num_robots_cmd = DeclareLaunchArgument(
         'num_robots',
-        default_value='1',
+        default_value='3',
         description='Number of robots to spawn')
     
     declare_random_seed_cmd = DeclareLaunchArgument(
@@ -115,7 +115,7 @@ def generate_launch_description():
                           'random_seed': random_seed,
                           'use_nav2': 'false',
                           'headless': 'false',
-                          'limit_real_time_factor': 'true',
+                          'limit_real_time_factor': 'false',
                           'wait_for_items': 'false',
                           # 'extra_gazebo_args': '--verbose',
                           }.items()

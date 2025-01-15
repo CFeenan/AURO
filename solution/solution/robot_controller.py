@@ -12,7 +12,7 @@ from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from auro_interfaces.msg import StringWithPose
-from assessment_interfaces.msg import  Zone, ZoneList, Item, ItemList
+from assessment_interfaces.msg import  Zone, ZoneList, Item, ItemList, RobotList, Robot
 from auro_interfaces.srv import ItemRequest
 
 from tf_transformations import euler_from_quaternion
@@ -35,7 +35,6 @@ SCAN_LEFT = 1
 SCAN_BACK = 2
 SCAN_RIGHT = 3
 
-
 # Finite state machine (FSM) states
 class State(Enum):
     FORWARD = 0
@@ -43,25 +42,16 @@ class State(Enum):
     COLLECTING = 2
     LOOKING = 3
     RETRIEVING = 4 
-    
+    WAITING = 5
     
 class RobotController(Node):
 
     def __init__(self):
         super().__init__('robot_controller')
 
-        #self.declare_parameter('x', 0.0)
-        #self.declare_parameter('y', 0.0)
-        #self.declare_parameter('yaw', 0.0)
-        
-        # zoneDict = {}
-
-        #self.initial_x = self.get_parameter('x').get_parameter_value().double_value
-        #self.initial_y = self.get_parameter('y').get_parameter_value().double_value
-        #self.initial_yaw = self.get_parameter('yaw').get_parameter_value().double_value
-
         # Class variables used to store persistent values between executions of callbacks and control loop
         self.state = State.FORWARD # Current FSM state
+        self.prior_state = State.FORWARD
         self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
         self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
         self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
@@ -72,14 +62,16 @@ class RobotController(Node):
         self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
         self.items = ItemList()
         self.zones = ZoneList()
+        self.robots = RobotList()
         self.look_count = 0
         self.front_left_ranges = []
         self.front_right_ranges = []
         self.carrying_item = False
         self.looking_initialised = False
+        self.retrieving_procedure = False 
+        self.wait_count = False
 
-        self.declare_parameter('robot_id', 'robot1')
-        self.robot_id = self.get_parameter('robot_id').value
+        self.robot_id = self.get_namespace().strip("/")
         
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
@@ -89,20 +81,26 @@ class RobotController(Node):
         
         self.zone_subscriber = self.create_subscription(
             ZoneList,
-            '/robot1/zone',
+            f"/{self.robot_id}/zone",
             self.zone_callback,
             10
         )
     
         self.odom_subscriber = self.create_subscription(
             Odometry,
-            '/robot1/odom',
+            f"/{self.robot_id}/odom",
             self.odom_callback,
+            10)
+        
+        self.robot_subscriber = self.create_subscription(
+            RobotList,
+            f"/{self.robot_id}/robots",
+            self.robot_callback,
             10)
         
         self.item_subscriber = self.create_subscription(
             ItemList,
-            '/robot1/items',
+            f"/{self.robot_id}/items",
             self.item_callback,
             10,  
             callback_group=timer_callback_group
@@ -110,15 +108,15 @@ class RobotController(Node):
         
         self.scan_subscriber = self.create_subscription(
             LaserScan,
-            '/robot1/scan',
+            f"/{self.robot_id}/scan",
             self.scan_callback,
             QoSPresetProfiles.SENSOR_DATA.value,
              callback_group=timer_callback_group
         )
         
-        self.cmd_vel_publisher = self.create_publisher(Twist, '/robot1/cmd_vel', 10)
+        self.cmd_vel_publisher = self.create_publisher(Twist, f"/{self.robot_id}/cmd_vel", 10)
         
-        self.marker_publisher = self.create_publisher(StringWithPose, '/robot1/marker_input', 10)
+        self.marker_publisher = self.create_publisher(StringWithPose, f"/{self.robot_id}/marker_input", 10)
         
         # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
         self.timer_period = 0.1 # 100 milliseconds = 10 Hz
@@ -130,6 +128,9 @@ class RobotController(Node):
 
     def zone_callback(self, msg):
         self.zones = msg
+        
+    def robot_callback(self, msg):
+        self.robots = msg
         
     def odom_callback(self, msg):
         self.pose = msg.pose.pose # Store the pose in a class variable
@@ -168,7 +169,6 @@ class RobotController(Node):
           # Process ranges for specific segments
         self.front_left_ranges = msg.ranges[345:360] + msg.ranges[0:15]  # Adjust for circular indexing
         self.front_right_ranges = msg.ranges[15:30] + msg.ranges[330:345]
-        
     
     # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
@@ -180,8 +180,24 @@ class RobotController(Node):
         self.marker_publisher.publish(marker_input)
 
         self.get_logger().info(f"{self.state}")
-
         
+        if len(self.robots.data) >= 1:
+            
+            close_robot = any(robot.size > 0.3 for robot in self.robots.data)
+            self.get_logger().info(f"{self.robots.data[0].size}")
+            if close_robot == True and self.state != State.WAITING:
+                self.prior_state = self.state
+                self.state = State.WAITING
+            elif close_robot ==True:
+                return
+            else:
+                if self.state == State.WAITING:
+                    self.state = self.prior_state
+        else:
+            if self.state == State.WAITING:
+                self.state = self.prior_state
+                    
+                
         match self.state:
             
             case State.FORWARD:
@@ -194,34 +210,6 @@ class RobotController(Node):
                 if len(self.zones.data) > 0 and self.carrying_item == True:
                     distance_check = any(float(zone.size) > 0.05 for zone in self.zones.data)
                     return
-                
-                # if self.scan_triggered[SCAN_FRONT]:
-                #     # Check specific segments within SCAN_FRONT
-                #     obstacle_front_left = any(
-                #         r < SCAN_THRESHOLD for r in self.front_left_ranges if r < float('inf') and not math.isnan(r)
-                #     )
-                #     obstacle_front_right = any(
-                #         r < SCAN_THRESHOLD for r in self.front_right_ranges if r < float('inf') and not math.isnan(r)
-                #     )
-
-                #     if obstacle_front_left and obstacle_front_right:
-                #         self.turn_direction = TURN_RIGHT
-                #         self.get_logger().info("Obstacles detected in both front-left and front-right sectors, turning right.")
-                #     elif obstacle_front_left:
-                #         self.turn_direction = TURN_RIGHT
-                #         self.get_logger().info("Obstacle detected in front-left sector, turning right.")
-                #     elif obstacle_front_right:
-                #         self.turn_direction = TURN_LEFT
-                #         self.get_logger().info("Obstacle detected in front-right sector, turning left.")
-                #     else:
-                #         self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                #         self.get_logger().info("General obstacle detected in front sector, randomly choosing turn direction.")
-
-                #     self.previous_yaw = self.yaw
-                #     self.state = State.TURNING
-                #     self.turn_angle = random.uniform(50, 80)
-                #     self.get_logger().info(f"Turning {('left' if self.turn_direction == TURN_LEFT else 'right')} by {self.turn_angle:.2f} degrees")
-                #     return
                 
                 if self.scan_triggered[SCAN_FRONT]:
                     self.previous_yaw = self.yaw
@@ -349,6 +337,7 @@ class RobotController(Node):
                     self.previous_pose = self.pose
                     self.state = State.FORWARD
                     return
+
                 
                 closestItem = 0
                 
@@ -414,7 +403,7 @@ class RobotController(Node):
                 # Improved speed calculation
                 k = 0.015  # Scaling factor
                 max_speed = 0.7  # Maximum speed in m/s
-                min_speed = 0.2  # Minimum speed in m/s
+                min_speed = 0.3  # Minimum speed in m/s
 
                 try:
                     zone_size = float(zone.size)
@@ -425,10 +414,18 @@ class RobotController(Node):
                 except Exception as e:
                     self.get_logger().error(f"Error calculating speed: {e}")
                     estimated_speed = min_speed
-                
-                if float(zone.size) >= 0.97:
+                    
+                    
+               
+                if float(zone.size) >= 1.00:
+                    
+                    while self.wait_count <= 5:
+                        self.wait_count += 1
+                        return
+                    
                     rqt = ItemRequest.Request()
                     rqt.robot_id = self.robot_id
+                    
                     
                     try:
                         future = self.offload_service.call_async(rqt)
@@ -438,7 +435,6 @@ class RobotController(Node):
                             
                             msg = Twist()
                             msg.linear.x = 0.0
-                            
                             self.cmd_vel_publisher.publish(msg)
                             
                             self.get_logger().info('Item dropped off.')
@@ -455,6 +451,13 @@ class RobotController(Node):
                 msg.linear.x = estimated_speed
                 msg.angular.z = zone.x / 320.0
                 self.cmd_vel_publisher.publish(msg)
+            
+            case State.WAITING:
+                msg = Twist()
+                msg.linear.x = 0.0
+                self.cmd_vel_publisher.publish(msg)
+                
+                
                 
 
             case _:
